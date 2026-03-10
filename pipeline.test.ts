@@ -145,3 +145,110 @@ test('bunny sheet regression splits into six expressions', { timeout: 180_000 },
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error Path Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('rejects non-existent input file', async () => {
+  const tempDir = await makeTempDir('image-to-rive-error-');
+  try {
+    const nonExistentPath = path.join(tempDir, 'does-not-exist.png');
+    await assert.rejects(
+      runPipeline({
+        inputImage: nonExistentPath,
+        outputBundle: path.join(tempDir, 'output.rivebundle'),
+        meshDensity: 0.06,
+        animations: ['idle'],
+        sheetMode: 'single',
+      }),
+      /not found|does not exist|ENOENT/i
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('rejects unsupported file extension', async () => {
+  const tempDir = await makeTempDir('image-to-rive-error-');
+  try {
+    const invalidFile = path.join(tempDir, 'test.txt');
+    await fs.writeFile(invalidFile, 'not an image');
+    await assert.rejects(
+      runPipeline({
+        inputImage: invalidFile,
+        outputBundle: path.join(tempDir, 'output.rivebundle'),
+        meshDensity: 0.06,
+        animations: ['idle'],
+        sheetMode: 'single',
+      }),
+      /unsupported|extension|png|jpg|jpeg/i
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('rejects invalid mesh density', async () => {
+  const tempDir = await makeTempDir('image-to-rive-error-');
+  try {
+    const input = path.join(tempDir, 'test.png');
+    makeSyntheticPng(input);
+    await assert.rejects(
+      runPipeline({
+        inputImage: input,
+        outputBundle: path.join(tempDir, 'output.rivebundle'),
+        meshDensity: 0.5, // Invalid: should be in [0.01, 0.15]
+        animations: ['idle'],
+        sheetMode: 'single',
+      }),
+      /meshDensity|range|0\.01|0\.15/i
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('rejects invalid animation preset', async () => {
+  const tempDir = await makeTempDir('image-to-rive-error-');
+  try {
+    const input = path.join(tempDir, 'test.png');
+    makeSyntheticPng(input);
+    await assert.rejects(
+      runPipeline({
+        inputImage: input,
+        outputBundle: path.join(tempDir, 'output.rivebundle'),
+        meshDensity: 0.06,
+        animations: ['invalid_preset' as 'idle'], // Type assertion to bypass TS
+        sheetMode: 'single',
+      }),
+      /unsupported|animation|preset/i
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('generates animations with compatibility warnings for generic skeletons', async () => {
+  const tempDir = await makeTempDir('image-to-rive-compat-');
+  try {
+    const input = path.join(tempDir, 'test.png');
+    makeSyntheticPng(input);
+    
+    const result = await runPipeline({
+      inputImage: input,
+      outputBundle: path.join(tempDir, 'output.rivebundle'),
+      meshDensity: 0.06,
+      animations: ['walk', 'idle'], // walk requires limbs, generic skeleton may not have them
+      sheetMode: 'single',
+    });
+    
+    // Should complete but may have warnings
+    assert.equal(result.exportKind, 'rivebundle');
+    // Should still generate at least idle animation
+    const normalizedAnimationNames = result.animationNames.map((name) => name.toLowerCase());
+    assert.ok(normalizedAnimationNames.includes('idle'), 'should generate idle animation');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});

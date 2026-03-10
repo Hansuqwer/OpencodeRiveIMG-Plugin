@@ -11,6 +11,24 @@ const TOOL_VERSION = '0.2.0';
 const ANIMATION_PRESETS: AnimationPreset[] = ['idle', 'walk', 'wave', 'jump', 'run', 'death'];
 const SHEET_MODES = new Set(['auto', 'single', 'split']);
 
+/**
+ * Resolves a user-provided path against a base directory and validates
+ * that the resolved path does not escape the base directory.
+ * Prevents path traversal attacks (e.g., ../../../etc/passwd).
+ */
+function safeResolvePath(baseDir: string, userPath: string): string {
+  const resolved = path.resolve(baseDir, userPath);
+  const normalizedBase = path.normalize(baseDir + path.sep);
+  const normalizedResolved = path.normalize(resolved + path.sep);
+  
+  // Check that resolved path is within base directory
+  if (!normalizedResolved.startsWith(normalizedBase)) {
+    throw new Error(`Path traversal denied: "${userPath}" escapes base directory`);
+  }
+  
+  return resolved;
+}
+
 /* ── Default .rive/config.json ─────────────────────────────────────────── */
 
 const DEFAULT_CONFIG = {
@@ -136,7 +154,7 @@ Commands:
 
 Options (convert):
   -o, --output <path>         Output .rivebundle path
-      --mesh-density <n>      Mesh density in [0.01, 0.15] (default 0.06)
+      --mesh-density <n>      Mesh point spacing in [0.01, 0.15]. Lower values = denser mesh (default 0.06)
       --animations <list>     Comma-separated presets: idle,walk,wave,jump,run,death
       --width <px>            Override artboard width
       --height <px>           Override artboard height
@@ -449,14 +467,16 @@ const imageToRiveTool: OpenCodeTool = {
     },
   },
   async execute(params, ctx) {
-    const inputImage = path.resolve(ctx.cwd, String(params.input_image));
+    // Validate and resolve input/output paths to prevent path traversal
+    const inputImage = safeResolvePath(ctx.cwd, String(params.input_image));
     const outputBundleRaw =
       typeof params.output_bundle === 'string'
         ? params.output_bundle
         : typeof params.output_riv === 'string'
           ? params.output_riv
           : `${path.parse(inputImage).name}.rivebundle`;
-    const outputBundle = path.resolve(ctx.cwd, outputBundleRaw);
+    const outputBundle = safeResolvePath(ctx.cwd, outputBundleRaw);
+
 
     ctx.log(`image-to-rive: processing ${inputImage}`);
 

@@ -13,6 +13,8 @@
  *   - death    : fall over (generic, gravity-like rotation)
  */
 
+import { BONE_NAMES, BONE_GROUPS, hasBoneWithAliases } from './bone-names.js';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,4 +479,103 @@ export function getPropertyRiveKey(prop: BoneTrack['property']): number {
     scaleY:   17,
   };
   return map[prop];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Animation Compatibility Checks
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AnimationCompatibilityResult {
+  compatible: boolean;
+  warnings: string[];
+  supportedPresets: AnimationPreset[];
+}
+
+/**
+ * Check if a skeleton supports the requested animation presets.
+ * Returns warnings for incompatible presets.
+ */
+export function checkAnimationCompatibility(
+  boneNames: string[],
+  requestedPresets: AnimationPreset[]
+): AnimationCompatibilityResult {
+  const warnings: string[] = [];
+  const supportedPresets: AnimationPreset[] = [];
+
+  // Helper to check if bone exists (with aliases for cross-skeleton compatibility)
+  const hasBone = (name: string): boolean => boneNames.includes(name);
+  const hasAny = (names: string[]): boolean => names.some(hasBone);
+
+  // Check limb availability
+  const hasLimbs = hasAny(BONE_GROUPS.LIMBS);
+  const hasArms = hasAny([
+    BONE_NAMES.LEFT_UPPER_ARM,
+    BONE_NAMES.RIGHT_UPPER_ARM,
+    BONE_NAMES.LEFT_FRONT_UPPER,
+    BONE_NAMES.RIGHT_FRONT_UPPER,
+  ]);
+
+  for (const preset of requestedPresets) {
+    switch (preset) {
+      case 'idle':
+        // Idle only needs spine or any bones
+        if (hasBone(BONE_NAMES.SPINE) || hasBone(BONE_NAMES.ROOT) || boneNames.length > 0) {
+          supportedPresets.push(preset);
+        } else {
+          warnings.push(`${preset} animation requires at least one bone`);
+        }
+        break;
+
+      case 'wave':
+        // Wave needs arms
+        if (hasArms) {
+          supportedPresets.push(preset);
+        } else {
+          warnings.push(`${preset} animation requires arm bones (l_upper_arm/r_upper_arm or l_front_upper/r_front_upper)`);
+        }
+        break;
+
+      case 'walk':
+      case 'run':
+      case 'jump':
+      case 'death':
+        // These need limbs (legs for walk/run/jump, full body for death)
+        if (hasLimbs) {
+          supportedPresets.push(preset);
+        } else {
+          warnings.push(`${preset} animation requires limb bones (arms or legs)`);
+        }
+        break;
+
+      default:
+        warnings.push(`Unknown animation preset: ${preset}`);
+    }
+  }
+
+  return {
+    compatible: supportedPresets.length === requestedPresets.length,
+    warnings,
+    supportedPresets,
+  };
+}
+
+/**
+ * Get a human-readable description of which bones an animation preset needs.
+ */
+export function getPresetRequiredBones(preset: AnimationPreset): string {
+  switch (preset) {
+    case 'idle':
+      return 'spine or root (optional)';
+    case 'wave':
+      return 'l_upper_arm/r_upper_arm (or l_front_upper/r_front_upper for quadrupeds)';
+    case 'walk':
+    case 'run':
+      return 'l_upper_leg/r_upper_leg (or l_hind_upper/r_hind_upper for quadrupeds)';
+    case 'jump':
+      return 'l_upper_leg/r_upper_leg (or l_hind_upper/r_hind_upper for quadrupeds)';
+    case 'death':
+      return 'spine, l_upper_arm/r_upper_arm, l_upper_leg/r_upper_leg (or quadruped equivalents)';
+    default:
+      return 'unknown';
+  }
 }

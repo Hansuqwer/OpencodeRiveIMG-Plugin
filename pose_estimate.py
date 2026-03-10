@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -20,9 +21,48 @@ from PIL import Image
 
 try:
     import mediapipe as mp  # type: ignore
+
     MEDIAPIPE_AVAILABLE = True
 except Exception:
     MEDIAPIPE_AVAILABLE = False
+
+
+@dataclass(frozen=True)
+class SkeletonConfig:
+    """Configuration for skeleton type detection heuristics.
+
+    These thresholds control how the pipeline classifies subjects into
+    different skeleton types (biped, quadruped, generic, etc.).
+    """
+
+    # Creature detection thresholds
+    min_symmetry_for_creature: float = (
+        0.55  # Minimum symmetry score to consider creature-like
+    )
+    min_upper_dual_presence: float = (
+        0.30  # Y-normalized range for upper body dual presence check
+    )
+    min_lower_dual_presence: float = (
+        0.72  # Y-normalized range for lower body dual presence check
+    )
+
+    # Quadruped detection thresholds
+    side_view_aspect_ratio_min: float = (
+        1.3  # W/H ratio for side-view quadruped detection
+    )
+    side_view_symmetry_max: float = 0.65  # Maximum symmetry for side-view quadruped
+    front_view_aspect_ratio_min: float = 0.75
+    front_view_aspect_ratio_max: float = 1.30
+    min_lower_body_mass_ratio: float = (
+        0.45  # Required lower body mass for front-view quadruped
+    )
+
+    # MediaPipe detection thresholds
+    mediapipe_min_confidence: float = 0.35
+
+
+# Default configuration instance
+DEFAULT_CONFIG = SkeletonConfig()
 
 
 def log(message: str) -> None:
@@ -172,7 +212,7 @@ def has_dual_presence(mask: np.ndarray, y0_norm: float, y1_norm: float) -> bool:
     h, w = mask.shape
     y0 = int(round(y0_norm * (h - 1)))
     y1 = int(round(y1_norm * (h - 1)))
-    region = mask[y0:y1 + 1]
+    region = mask[y0 : y1 + 1]
     if region.size == 0:
         return False
     left = np.any(region[:, : w // 2] > 0)
@@ -214,8 +254,12 @@ def build_creature_front_biped(mask: np.ndarray):
     neck = centre_point(mask, centre_x, 0.32)
     head = centre_point(mask, centre_x, 0.20)
 
-    left_shoulder = side_point(mask, 0.46, "left", 0.35) or side_point(mask, 0.46, "left", 0.25)
-    right_shoulder = side_point(mask, 0.46, "right", 0.35) or side_point(mask, 0.46, "right", 0.25)
+    left_shoulder = side_point(mask, 0.46, "left", 0.35) or side_point(
+        mask, 0.46, "left", 0.25
+    )
+    right_shoulder = side_point(mask, 0.46, "right", 0.35) or side_point(
+        mask, 0.46, "right", 0.25
+    )
     left_elbow = side_point(mask, 0.62, "left", 0.14) or left_shoulder
     right_elbow = side_point(mask, 0.62, "right", 0.14) or right_shoulder
     left_wrist = side_point(mask, 0.82, "left", 0.10) or left_elbow
@@ -242,12 +286,18 @@ def build_creature_front_biped(mask: np.ndarray):
         make_bone("r_ear", "head", "ear", right_ear_base, right_ear_tip, (w, h)),
         make_bone("l_upper_arm", "spine", "arm", spine_mid, left_elbow, (w, h)),
         make_bone("r_upper_arm", "spine", "arm", spine_mid, right_elbow, (w, h)),
-        make_bone("l_lower_arm", "l_upper_arm", "forearm", left_elbow, left_wrist, (w, h)),
-        make_bone("r_lower_arm", "r_upper_arm", "forearm", right_elbow, right_wrist, (w, h)),
+        make_bone(
+            "l_lower_arm", "l_upper_arm", "forearm", left_elbow, left_wrist, (w, h)
+        ),
+        make_bone(
+            "r_lower_arm", "r_upper_arm", "forearm", right_elbow, right_wrist, (w, h)
+        ),
         make_bone("l_upper_leg", "root", "leg", left_hip, left_knee, (w, h)),
         make_bone("r_upper_leg", "root", "leg", right_hip, right_knee, (w, h)),
         make_bone("l_lower_leg", "l_upper_leg", "shin", left_knee, left_ankle, (w, h)),
-        make_bone("r_lower_leg", "r_upper_leg", "shin", right_knee, right_ankle, (w, h)),
+        make_bone(
+            "r_lower_leg", "r_upper_leg", "shin", right_knee, right_ankle, (w, h)
+        ),
     ]
 
     return {
@@ -256,6 +306,7 @@ def build_creature_front_biped(mask: np.ndarray):
         "symmetry_score": round(symmetry_score(mask), 4),
         "bones": bones,
     }
+
 
 def tail_point(mask: np.ndarray):
     """Detect a probable tail tip — the bottommost or outermost point that
@@ -297,16 +348,26 @@ def build_quadruped_front(mask: np.ndarray):
     head = centre_point(mask, centre_x, 0.18)
 
     # Front legs (from shoulders, roughly at 0.42-0.65 height)
-    l_front_upper = side_point(mask, 0.42, "left", 0.30) or side_point(mask, 0.42, "left", 0.20)
-    r_front_upper = side_point(mask, 0.42, "right", 0.30) or side_point(mask, 0.42, "right", 0.20)
+    l_front_upper = side_point(mask, 0.42, "left", 0.30) or side_point(
+        mask, 0.42, "left", 0.20
+    )
+    r_front_upper = side_point(mask, 0.42, "right", 0.30) or side_point(
+        mask, 0.42, "right", 0.20
+    )
     l_front_lower = side_point(mask, 0.62, "left", 0.12) or l_front_upper
     r_front_lower = side_point(mask, 0.62, "right", 0.12) or r_front_upper
 
     # Hind legs (from hips, roughly at 0.68-0.92 height)
     l_hind_upper = side_point(mask, 0.68, "left", 0.38) or pelvis
     r_hind_upper = side_point(mask, 0.68, "right", 0.38) or pelvis
-    l_hind_lower = foot_point(mask, "left") or side_point(mask, 0.88, "left", 0.18) or l_hind_upper
-    r_hind_lower = foot_point(mask, "right") or side_point(mask, 0.88, "right", 0.18) or r_hind_upper
+    l_hind_lower = (
+        foot_point(mask, "left") or side_point(mask, 0.88, "left", 0.18) or l_hind_upper
+    )
+    r_hind_lower = (
+        foot_point(mask, "right")
+        or side_point(mask, 0.88, "right", 0.18)
+        or r_hind_upper
+    )
 
     left_ear_tip = ear_tip(mask, "left") or l_front_upper
     right_ear_tip = ear_tip(mask, "right") or r_front_upper
@@ -322,12 +383,30 @@ def build_quadruped_front(mask: np.ndarray):
         make_bone("r_ear", "head", "ear", right_ear_base, right_ear_tip, (w, h)),
         make_bone("l_front_upper", "spine", "leg", spine_mid, l_front_upper, (w, h)),
         make_bone("r_front_upper", "spine", "leg", spine_mid, r_front_upper, (w, h)),
-        make_bone("l_front_lower", "l_front_upper", "shin", l_front_upper, l_front_lower, (w, h)),
-        make_bone("r_front_lower", "r_front_upper", "shin", r_front_upper, r_front_lower, (w, h)),
+        make_bone(
+            "l_front_lower",
+            "l_front_upper",
+            "shin",
+            l_front_upper,
+            l_front_lower,
+            (w, h),
+        ),
+        make_bone(
+            "r_front_lower",
+            "r_front_upper",
+            "shin",
+            r_front_upper,
+            r_front_lower,
+            (w, h),
+        ),
         make_bone("l_hind_upper", "root", "leg", l_hind_upper, l_hind_upper, (w, h)),
         make_bone("r_hind_upper", "root", "leg", r_hind_upper, r_hind_upper, (w, h)),
-        make_bone("l_hind_lower", "l_hind_upper", "shin", l_hind_upper, l_hind_lower, (w, h)),
-        make_bone("r_hind_lower", "r_hind_upper", "shin", r_hind_upper, r_hind_lower, (w, h)),
+        make_bone(
+            "l_hind_lower", "l_hind_upper", "shin", l_hind_upper, l_hind_lower, (w, h)
+        ),
+        make_bone(
+            "r_hind_lower", "r_hind_upper", "shin", r_hind_upper, r_hind_lower, (w, h)
+        ),
     ]
 
     # Optional tail
@@ -408,14 +487,26 @@ def build_quadruped_side(mask: np.ndarray):
         make_bone("spine_front", "spine_rear", "spine", spine_front, neck_pt, (w, h)),
         make_bone("neck", "spine_front", "neck", neck_pt, neck_pt, (w, h)),
         make_bone("head", "neck", "head", neck_pt, head_pt, (w, h)),
-        make_bone("l_front_upper", "spine_front", "leg", l_front_hip, l_front_hip, (w, h)),
-        make_bone("l_front_lower", "l_front_upper", "shin", l_front_hip, l_front_foot, (w, h)),
-        make_bone("r_front_upper", "spine_front", "leg", r_front_hip, r_front_hip, (w, h)),
-        make_bone("r_front_lower", "r_front_upper", "shin", r_front_hip, r_front_foot, (w, h)),
+        make_bone(
+            "l_front_upper", "spine_front", "leg", l_front_hip, l_front_hip, (w, h)
+        ),
+        make_bone(
+            "l_front_lower", "l_front_upper", "shin", l_front_hip, l_front_foot, (w, h)
+        ),
+        make_bone(
+            "r_front_upper", "spine_front", "leg", r_front_hip, r_front_hip, (w, h)
+        ),
+        make_bone(
+            "r_front_lower", "r_front_upper", "shin", r_front_hip, r_front_foot, (w, h)
+        ),
         make_bone("l_hind_upper", "root", "leg", l_hind_hip, l_hind_hip, (w, h)),
-        make_bone("l_hind_lower", "l_hind_upper", "shin", l_hind_hip, l_hind_foot, (w, h)),
+        make_bone(
+            "l_hind_lower", "l_hind_upper", "shin", l_hind_hip, l_hind_foot, (w, h)
+        ),
         make_bone("r_hind_upper", "root", "leg", r_hind_hip, r_hind_hip, (w, h)),
-        make_bone("r_hind_lower", "r_hind_upper", "shin", r_hind_hip, r_hind_foot, (w, h)),
+        make_bone(
+            "r_hind_lower", "r_hind_upper", "shin", r_hind_hip, r_hind_foot, (w, h)
+        ),
     ]
 
     # Optional tail (on opposite side from head)
@@ -430,6 +521,7 @@ def build_quadruped_side(mask: np.ndarray):
         "symmetry_score": round(symmetry_score(mask), 4),
         "bones": bones,
     }
+
 
 def build_generic_skeleton(mask: np.ndarray):
     h, w = mask.shape
@@ -454,7 +546,9 @@ def build_generic_skeleton(mask: np.ndarray):
     }
 
 
-def point_segment_distance(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+def point_segment_distance(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float
+) -> float:
     abx = bx - ax
     aby = by - ay
     denom = abx * abx + aby * aby
@@ -481,7 +575,9 @@ def compute_skinning_weights(skeleton: dict, mesh_vertices: list, size):
         for bone in skeleton["bones"]:
             start = bone["start"]
             end = bone["end"]
-            dist = point_segment_distance(vx, vy, start["x"], start["y"], end["x"], end["y"])
+            dist = point_segment_distance(
+                vx, vy, start["x"], start["y"], end["x"], end["y"]
+            )
 
             name = bone["name"]
             role = bone["role"]
@@ -547,12 +643,20 @@ def landmarks_to_humanoid_skeleton(landmarks, image_size, source_bounds):
         make_bone("head", "neck", "head", neck, head, (bounds["w"], bounds["h"])),
         make_bone("l_upper_arm", "spine", "arm", ls, le, (bounds["w"], bounds["h"])),
         make_bone("r_upper_arm", "spine", "arm", rs, re, (bounds["w"], bounds["h"])),
-        make_bone("l_lower_arm", "l_upper_arm", "forearm", le, lw, (bounds["w"], bounds["h"])),
-        make_bone("r_lower_arm", "r_upper_arm", "forearm", re, rw, (bounds["w"], bounds["h"])),
+        make_bone(
+            "l_lower_arm", "l_upper_arm", "forearm", le, lw, (bounds["w"], bounds["h"])
+        ),
+        make_bone(
+            "r_lower_arm", "r_upper_arm", "forearm", re, rw, (bounds["w"], bounds["h"])
+        ),
         make_bone("l_upper_leg", "root", "leg", lh, lk, (bounds["w"], bounds["h"])),
         make_bone("r_upper_leg", "root", "leg", rh, rk, (bounds["w"], bounds["h"])),
-        make_bone("l_lower_leg", "l_upper_leg", "shin", lk, la, (bounds["w"], bounds["h"])),
-        make_bone("r_lower_leg", "r_upper_leg", "shin", rk, ra, (bounds["w"], bounds["h"])),
+        make_bone(
+            "l_lower_leg", "l_upper_leg", "shin", lk, la, (bounds["w"], bounds["h"])
+        ),
+        make_bone(
+            "r_lower_leg", "r_upper_leg", "shin", rk, ra, (bounds["w"], bounds["h"])
+        ),
     ]
 
     return {
@@ -563,7 +667,21 @@ def landmarks_to_humanoid_skeleton(landmarks, image_size, source_bounds):
     }
 
 
-def infer_skeleton(mask: np.ndarray, component: dict, input_path: str | None, image_size):
+def infer_skeleton(
+    mask: np.ndarray,
+    component: dict,
+    input_path: str | None,
+    image_size,
+    config: SkeletonConfig = DEFAULT_CONFIG,
+):
+    h, w = mask.shape
+    aspect_ratio = w / max(h, 1)
+    symmetric = symmetry_score(mask)
+    creature_like = (
+        symmetric > config.min_symmetry_for_creature
+        and has_dual_presence(mask, 0.0, config.min_upper_dual_presence)
+        and has_dual_presence(mask, config.min_lower_dual_presence, 1.0)
+    )
     h, w = mask.shape
     aspect_ratio = w / max(h, 1)
     symmetric = symmetry_score(mask)
@@ -574,7 +692,13 @@ def infer_skeleton(mask: np.ndarray, component: dict, input_path: str | None, im
     )
 
     # --- MediaPipe humanoid attempt (single-subject humanoid images only) ---
-    if MEDIAPIPE_AVAILABLE and input_path and image_size and component.get("source_bounds") and component["id"].startswith("subject_"):
+    if (
+        MEDIAPIPE_AVAILABLE
+        and input_path
+        and image_size
+        and component.get("source_bounds")
+        and component["id"].startswith("subject_")
+    ):
         try:
             log("trying MediaPipe humanoid path")
             mp_pose = mp.solutions.pose
@@ -583,7 +707,7 @@ def infer_skeleton(mask: np.ndarray, component: dict, input_path: str | None, im
                 with mp_pose.Pose(
                     static_image_mode=True,
                     model_complexity=1,
-                    min_detection_confidence=0.35,
+                    min_detection_confidence=config.mediapipe_min_confidence,
                 ) as pose:
                     result = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
                     if result.pose_landmarks:
@@ -597,8 +721,36 @@ def infer_skeleton(mask: np.ndarray, component: dict, input_path: str | None, im
 
     # --- Quadruped detection heuristic ---
     # Side-view quadruped: significantly wider than tall
+    if (
+        aspect_ratio > config.side_view_aspect_ratio_min
+        and symmetric < config.side_view_symmetry_max
+    ):
+        log(
+            f"side-view quadruped heuristic (aspect={aspect_ratio:.2f}, sym={symmetric:.2f})"
+        )
+        return build_quadruped_side(mask)
+
+    # Front-view quadruped: near-square to wide, symmetric, with significant
+    # lower body mass.  Tall upright subjects (aspect < 0.75) strongly favour
+    # the biped path — real quadrupeds seen from front are at least ~square.
+    if (
+        creature_like
+        and config.front_view_aspect_ratio_min
+        <= aspect_ratio
+        <= config.front_view_aspect_ratio_max
+    ):
+        lower_mass_ratio = float(np.sum(mask[int(h * 0.60) :]) / max(np.sum(mask), 1))
+        # Require > 45% lower mass — four legs spread more mass below the midline
+        if lower_mass_ratio > config.min_lower_body_mass_ratio:
+            log(
+                f"front-view quadruped heuristic (aspect={aspect_ratio:.2f}, lower_mass={lower_mass_ratio:.2f})"
+            )
+            return build_quadruped_front(mask)
+    # Side-view quadruped: significantly wider than tall
     if aspect_ratio > 1.3 and symmetric < 0.65:
-        log(f"side-view quadruped heuristic (aspect={aspect_ratio:.2f}, sym={symmetric:.2f})")
+        log(
+            f"side-view quadruped heuristic (aspect={aspect_ratio:.2f}, sym={symmetric:.2f})"
+        )
         return build_quadruped_side(mask)
 
     # Front-view quadruped: near-square to wide, symmetric, with significant
@@ -608,7 +760,9 @@ def infer_skeleton(mask: np.ndarray, component: dict, input_path: str | None, im
         lower_mass_ratio = float(np.sum(mask[int(h * 0.60) :]) / max(np.sum(mask), 1))
         # Require > 45% lower mass — four legs spread more mass below the midline
         if lower_mass_ratio > 0.45:
-            log(f"front-view quadruped heuristic (aspect={aspect_ratio:.2f}, lower_mass={lower_mass_ratio:.2f})")
+            log(
+                f"front-view quadruped heuristic (aspect={aspect_ratio:.2f}, lower_mass={lower_mass_ratio:.2f})"
+            )
             return build_quadruped_front(mask)
 
     # --- Creature biped (front-facing, tall, symmetric) ---
@@ -638,11 +792,13 @@ def main():
                 component["mesh"]["vertices"],
                 (component["image_size"]["w"], component["image_size"]["h"]),
             )
-            output_components.append({
-                "id": component["id"],
-                "skeleton": skeleton,
-                "vertex_weights": weights,
-            })
+            output_components.append(
+                {
+                    "id": component["id"],
+                    "skeleton": skeleton,
+                    "vertex_weights": weights,
+                }
+            )
             log(
                 f"{component['id']}: {skeleton['type']} / {len(skeleton['bones'])} bones / "
                 f"{len(weights)} weighted vertices"
@@ -653,7 +809,15 @@ def main():
             "components": output_components,
         }
         Path(args.output).write_text(json.dumps(payload, indent=2))
-        print(json.dumps({"status": "ok", "output": args.output, "component_count": len(output_components)}))
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "output": args.output,
+                    "component_count": len(output_components),
+                }
+            )
+        )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}))
         sys.exit(1)

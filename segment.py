@@ -22,6 +22,12 @@ import numpy as np
 from PIL import Image
 from scipy.spatial import Delaunay
 
+# Image dimension limits to prevent DoS and ensure quality
+MAX_IMAGE_DIMENSION = 4096  # Prevent memory exhaustion
+MIN_IMAGE_DIMENSION = 32  # Prevent triangulation failures
+
+rembg_remove = None
+
 rembg_remove = None
 rembg_import_error = None
 try:
@@ -134,9 +140,11 @@ def sort_row_major(components, y_snap: int = 0):
     # tall blobs produce row boundaries that land a few pixels apart.
     if y_snap <= 0:
         return sorted(components, key=lambda item: (item["y"], item["x"]))
+
     def snap_key(item):
         snapped_y = (item["y"] // y_snap) * y_snap
         return (snapped_y, item["x"])
+
     return sorted(components, key=snap_key)
 
 
@@ -482,6 +490,21 @@ def main():
 
     try:
         rgba = load_rgba(args.input)
+
+        # Validate image dimensions
+        h, w = rgba.shape[:2]
+        if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
+            raise ValueError(
+                f"Image dimensions ({w}x{h}) exceed maximum allowed "
+                f"({MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION}). "
+                f"Large images may cause memory exhaustion."
+            )
+        if w < MIN_IMAGE_DIMENSION or h < MIN_IMAGE_DIMENSION:
+            raise ValueError(
+                f"Image dimensions ({w}x{h}) below minimum required "
+                f"({MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION}). "
+                f"Small images may fail triangulation."
+            )
 
         if has_meaningful_alpha(rgba):
             mask = mask_from_alpha(rgba)

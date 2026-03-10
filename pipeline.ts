@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   generateAnimations,
+  checkAnimationCompatibility,
   type AnimationPreset,
   type RiveAnimationDef,
 } from './animation.js';
@@ -433,9 +434,13 @@ async function runPythonJsonScript(
     const statusError = typeof status?.error === 'string' ? status.error : undefined;
 
     if (result.exitCode !== 0 || statusError) {
-      lastFailure = statusError ?? `Python stage ${stage} failed with exit code ${result.exitCode}.`;
+      // Include stderr in error message for better debugging context
+      const stderrPreview = result.stderr.slice(0, 2000);
+      lastFailure = statusError ?? 
+        `Python ${stage} failed (exit ${result.exitCode}):\n${stderrPreview || '(no stderr)'}`;
       continue;
     }
+
 
     if (!status || status.status !== 'ok') {
       lastFailure = `Python stage ${stage} returned an invalid status payload.`;
@@ -446,6 +451,90 @@ async function runPythonJsonScript(
   }
 
   throw new Error(lastFailure ?? `Unable to execute Python stage ${stage}.`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON Schema Validation for Python IPC Results
+// ─────────────────────────────────────────────────────────────────────────────
+
+function validateSegResult(data: unknown): SegResult {
+  if (!data || typeof data !== 'object') {
+    throw new Error('SegResult validation failed: expected object');
+  }
+  
+  const d = data as Record<string, unknown>;
+  
+  if (d.schema_version !== 2) {
+    throw new Error(`SegResult validation failed: expected schema_version 2, got ${d.schema_version}`);
+  }
+  
+  if (!Array.isArray(d.components)) {
+    throw new Error('SegResult validation failed: components must be an array');
+  }
+  
+  if (d.components.length === 0) {
+    throw new Error('SegResult validation failed: components array must not be empty');
+  }
+  
+  // Validate each component
+  for (let i = 0; i < d.components.length; i++) {
+    const comp = d.components[i] as Record<string, unknown>;
+    if (!comp.id || typeof comp.id !== 'string') {
+      throw new Error(`SegResult validation failed: component[${i}] missing valid 'id'`);
+    }
+    if (!comp.mesh || typeof comp.mesh !== 'object') {
+      throw new Error(`SegResult validation failed: component[${i}] missing 'mesh'`);
+    }
+    const mesh = comp.mesh as Record<string, unknown>;
+    if (!Array.isArray(mesh.vertices)) {
+      throw new Error(`SegResult validation failed: component[${i}] mesh missing 'vertices' array`);
+    }
+    if (!Array.isArray(mesh.triangles)) {
+      throw new Error(`SegResult validation failed: component[${i}] mesh missing 'triangles' array`);
+    }
+  }
+  
+  return d as unknown as SegResult;
+}
+
+function validatePoseResult(data: unknown): PoseResult {
+  if (!data || typeof data !== 'object') {
+    throw new Error('PoseResult validation failed: expected object');
+  }
+  
+  const d = data as Record<string, unknown>;
+  
+  if (d.schema_version !== 2) {
+    throw new Error(`PoseResult validation failed: expected schema_version 2, got ${d.schema_version}`);
+  }
+  
+  if (!Array.isArray(d.components)) {
+    throw new Error('PoseResult validation failed: components must be an array');
+  }
+  
+  if (d.components.length === 0) {
+    throw new Error('PoseResult validation failed: components array must not be empty');
+  }
+  
+  // Validate each component
+  for (let i = 0; i < d.components.length; i++) {
+    const comp = d.components[i] as Record<string, unknown>;
+    if (!comp.id || typeof comp.id !== 'string') {
+      throw new Error(`PoseResult validation failed: component[${i}] missing valid 'id'`);
+    }
+    if (!comp.skeleton || typeof comp.skeleton !== 'object') {
+      throw new Error(`PoseResult validation failed: component[${i}] missing 'skeleton'`);
+    }
+    const skeleton = comp.skeleton as Record<string, unknown>;
+    if (!Array.isArray(skeleton.bones)) {
+      throw new Error(`PoseResult validation failed: component[${i}] skeleton missing 'bones' array`);
+    }
+    if (!Array.isArray(comp.vertex_weights)) {
+      throw new Error(`PoseResult validation failed: component[${i}] missing 'vertex_weights' array`);
+    }
+  }
+  
+  return d as unknown as PoseResult;
 }
 
 async function runSegmentation(
@@ -475,10 +564,8 @@ async function runSegmentation(
     ctx,
   );
 
-  const payload = JSON.parse(await fs.readFile(outputJson, 'utf8')) as SegResult;
-  if (!Array.isArray(payload.components) || payload.components.length === 0) {
-    throw new Error('Segmentation produced no components.');
-  }
+  const rawPayload = JSON.parse(await fs.readFile(outputJson, 'utf8'));
+  const payload = validateSegResult(rawPayload);
   return payload;
 }
 
@@ -497,10 +584,8 @@ async function runPoseEstimation(
     ctx,
   );
 
-  const payload = JSON.parse(await fs.readFile(outputJson, 'utf8')) as PoseResult;
-  if (!Array.isArray(payload.components) || payload.components.length === 0) {
-    throw new Error('Pose estimation produced no components.');
-  }
+  const rawPayload = JSON.parse(await fs.readFile(outputJson, 'utf8'));
+  const payload = validatePoseResult(rawPayload);
   return payload;
 }
 
@@ -692,6 +777,7 @@ async function writeBundle(
   seg: SegResult,
   pose: PoseResult,
   logs: LogEntry[],
+  ctx: StageContext,
 ): Promise<{
   manifestPath: string;
   stateMachinePath: string;
@@ -725,8 +811,17 @@ async function writeBundle(
       await fs.mkdir(artboardDir, { recursive: true });
 
       const boneNames = poseComponent.skeleton.bones.map((bone) => bone.name);
-      const animations = generateAnimations(boneNames, opts.animations);
+      
+      // Check animation compatibility and add warnings
+      const compatibility = checkAnimationCompatibility(boneNames, opts.animations);
+      if (!compatibility.compatible) {
+        ctx.warnings.push(...compatibility.warnings);
+      }
+      
+      // Generate only compatible animations
+      const animations = generateAnimations(boneNames, compatibility.supportedPresets);
       stateItems.push({ id: component.id, label: component.label, animations });
+
 
       const maskedTarget = path.join(artboardDir, 'masked.png');
       await copyFileIntoBundle(component.masked_png_path, maskedTarget);
@@ -812,8 +907,36 @@ async function writeBundle(
     };
     await writeJson(manifestPath, manifest);
 
-    await fs.rm(finalBundleDir, { recursive: true, force: true });
-    await fs.rename(tempBundleDir, finalBundleDir);
+    // Atomic bundle write with backup-swap pattern
+    // This prevents data loss if the rename operation fails
+    const backupDir = `${finalBundleDir}.backup`;
+    let hasBackup = false;
+    
+    try {
+      // Step 1: If existing bundle, move to backup
+      if (existsSync(finalBundleDir)) {
+        await fs.rename(finalBundleDir, backupDir);
+        hasBackup = true;
+      }
+      
+      // Step 2: Move temp to final
+      await fs.rename(tempBundleDir, finalBundleDir);
+      
+      // Step 3: Clean up backup (success!)
+      if (hasBackup) {
+        await fs.rm(backupDir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      // Recovery: restore from backup if something went wrong
+      if (hasBackup && !existsSync(finalBundleDir)) {
+        try {
+          await fs.rename(backupDir, finalBundleDir);
+        } catch {
+          // Ignore recovery errors - we've done our best
+        }
+      }
+      throw error;
+    }
 
     return {
       manifestPath: path.join(finalBundleDir, 'bundle.json'),
@@ -874,7 +997,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     const pose = await runPoseEstimation(normalized, segJsonPath, tmpDir, ctx);
 
     normalized.onProgress('bundle', 75, 'Writing `.rivebundle` fallback artifacts');
-    const bundle = await writeBundle(normalized, seg, pose, logs);
+    const bundle = await writeBundle(normalized, seg, pose, logs, ctx);
 
     normalized.onProgress('done', 100, 'Pipeline completed');
 
@@ -915,9 +1038,15 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
     };
   } finally {
     if (!normalized.keepTemp) {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        log('warn', 'cleanup', `Failed to remove temporary directory: ${errorMessage}`, { tmpDir });
+      }
     } else {
       log('warn', 'cleanup', 'Temporary directory retained because keepTemp=true.', { tmpDir });
     }
-  }
+
+}
 }
