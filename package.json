@@ -1,0 +1,55 @@
+{
+  "name": "image-to-rive",
+  "version": "0.2.0",
+  "description": "OpenCode plugin and CLI that converts images into rigged Rive-ready intermediate bundles.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "image-to-rive": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli.js",
+      "types": "./dist/cli.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "segment.py",
+    "pose_estimate.py",
+    "README.md",
+    "INSTALL.md",
+    "requirements.txt",
+    "requirements.optional.txt",
+    "LICENSE",
+    "tests/assets/ModelExpressions.png"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist .tmp .test-output",
+    "test": "npm run build && node --test dist/pipeline.test.js",
+    "init": "node dist/cli.js init",
+    "check-deps": "node dist/cli.js check-deps",
+    "setup:python": "python3 -m pip install -r requirements.txt && python3 -m pip install -r requirements.optional.txt || true"
+  },
+  "keywords": [
+    "opencode",
+    "rive",
+    "rigging",
+    "animation",
+    "computer-vision"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.3"
+  }
+}
