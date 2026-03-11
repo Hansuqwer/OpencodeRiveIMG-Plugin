@@ -26,6 +26,36 @@ const VALID_ANIMATIONS = new Set<AnimationPreset>([
   'death',
 ]);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SAFE_COMPONENT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+const DEFAULT_STAGE_TIMEOUT_MS = 60_000;
+const DEFAULT_STAGE_KILL_GRACE_MS = 2_000;
+const DEFAULT_STAGE_OUTPUT_CAP_BYTES = 1_000_000;
+
+export interface CommandExecutionLimits {
+  timeoutMs: number;
+  killGraceMs: number;
+  maxStdoutBytes: number;
+  maxStderrBytes: number;
+}
+
+const DEFAULT_COMMAND_LIMITS: CommandExecutionLimits = {
+  timeoutMs: DEFAULT_STAGE_TIMEOUT_MS,
+  killGraceMs: DEFAULT_STAGE_KILL_GRACE_MS,
+  maxStdoutBytes: DEFAULT_STAGE_OUTPUT_CAP_BYTES,
+  maxStderrBytes: DEFAULT_STAGE_OUTPUT_CAP_BYTES,
+};
+
+export interface RunCommandResult {
+  exitCode: number;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  error?: NodeJS.ErrnoException;
+  timedOut: boolean;
+  outputLimitExceeded: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}
 
 export interface LogEntry {
   timestamp: string;
@@ -354,36 +384,133 @@ function getPythonCandidates(): string[] {
   return candidates.filter((value): value is string => Boolean(value));
 }
 
+function appendWithByteCap(current: string, chunk: string, maxBytes: number): {
+  next: string;
+  truncated: boolean;
+} {
+  if (maxBytes <= 0) {
+    return { next: current, truncated: true };
+  }
+
+  const currentBytes = Buffer.byteLength(current, 'utf8');
+  if (currentBytes >= maxBytes) {
+    return { next: current, truncated: true };
+  }
+
+  const remaining = maxBytes - currentBytes;
+  const chunkBytes = Buffer.byteLength(chunk, 'utf8');
+  if (chunkBytes <= remaining) {
+    return { next: `${current}${chunk}`, truncated: false };
+  }
+
+  const truncatedChunk = Buffer.from(chunk, 'utf8').subarray(0, remaining).toString('utf8');
+  return { next: `${current}${truncatedChunk}`, truncated: true };
+}
+
 async function runCommand(
   command: string,
   args: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string; error?: NodeJS.ErrnoException }> {
+  limits: CommandExecutionLimits,
+): Promise<RunCommandResult> {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+    let outputLimitExceeded = false;
+    let finished = false;
+    let killTimer: NodeJS.Timeout | undefined;
+
+    const finish = (result: RunCommandResult): void => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+      }
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+      resolve(result);
+    };
 
     const child = spawn(command, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
 
+    const requestTermination = (): void => {
+      if (finished) {
+        return;
+      }
+      child.kill('SIGTERM');
+      if (!killTimer) {
+        killTimer = setTimeout(() => {
+          if (!finished) {
+            child.kill('SIGKILL');
+          }
+        }, limits.killGraceMs);
+      }
+    };
+
+    const timeoutTimer =
+      limits.timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            requestTermination();
+          }, limits.timeoutMs)
+        : undefined;
+
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
 
     child.stdout.on('data', (chunk: string) => {
-      stdout += chunk;
+      const updated = appendWithByteCap(stdout, chunk, limits.maxStdoutBytes);
+      stdout = updated.next;
+      if (updated.truncated) {
+        stdoutTruncated = true;
+        outputLimitExceeded = true;
+        requestTermination();
+      }
     });
 
     child.stderr.on('data', (chunk: string) => {
-      stderr += chunk;
+      const updated = appendWithByteCap(stderr, chunk, limits.maxStderrBytes);
+      stderr = updated.next;
+      if (updated.truncated) {
+        stderrTruncated = true;
+        outputLimitExceeded = true;
+        requestTermination();
+      }
     });
 
     child.on('error', (error: NodeJS.ErrnoException) => {
-      resolve({ exitCode: -1, stdout, stderr, error });
+      finish({
+        exitCode: -1,
+        signal: null,
+        stdout,
+        stderr,
+        error,
+        timedOut,
+        outputLimitExceeded,
+        stdoutTruncated,
+        stderrTruncated,
+      });
     });
 
-    child.on('close', (code: number | null) => {
-      resolve({ exitCode: code ?? -1, stdout, stderr });
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      finish({
+        exitCode: code ?? -1,
+        signal,
+        stdout,
+        stderr,
+        timedOut,
+        outputLimitExceeded,
+        stdoutTruncated,
+        stderrTruncated,
+      });
     });
   });
 }
@@ -415,7 +542,7 @@ async function runPythonJsonScript(
   let lastFailure: string | undefined;
 
   for (const pythonCommand of getPythonCandidates()) {
-    const result = await runCommand(pythonCommand, [scriptPath, ...scriptArgs]);
+    const result = await runCommand(pythonCommand, [scriptPath, ...scriptArgs], DEFAULT_COMMAND_LIMITS);
 
     if (result.error?.code === 'ENOENT') {
       lastFailure = `Python interpreter "${pythonCommand}" was not found.`;
@@ -432,6 +559,19 @@ async function runPythonJsonScript(
 
     const status = parseStatusJson(result.stdout);
     const statusError = typeof status?.error === 'string' ? status.error : undefined;
+
+    if (result.timedOut) {
+      lastFailure = `Python ${stage} timed out after ${DEFAULT_COMMAND_LIMITS.timeoutMs}ms.`;
+      continue;
+    }
+
+    if (result.outputLimitExceeded) {
+      lastFailure =
+        `Python ${stage} exceeded output limits ` +
+        `(stdout cap ${DEFAULT_COMMAND_LIMITS.maxStdoutBytes} bytes, ` +
+        `stderr cap ${DEFAULT_COMMAND_LIMITS.maxStderrBytes} bytes).`;
+      continue;
+    }
 
     if (result.exitCode !== 0 || statusError) {
       // Include stderr in error message for better debugging context
@@ -457,43 +597,184 @@ async function runPythonJsonScript(
 // JSON Schema Validation for Python IPC Results
 // ─────────────────────────────────────────────────────────────────────────────
 
+function assertFiniteNumber(value: unknown, message: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function assertPositiveInt(value: unknown, message: string): number {
+  const parsed = assertFiniteNumber(value, message);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(message);
+  }
+  return parsed;
+}
+
+function assertComponentId(value: unknown, message: string): string {
+  if (typeof value !== 'string' || !SAFE_COMPONENT_ID_RE.test(value)) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function assertRect(value: unknown, messagePrefix: string): Rect {
+  if (!value || typeof value !== 'object') {
+    throw new Error(`${messagePrefix} must be an object`);
+  }
+  const rect = value as Record<string, unknown>;
+  return {
+    x: assertFiniteNumber(rect.x, `${messagePrefix}.x must be a finite number`),
+    y: assertFiniteNumber(rect.y, `${messagePrefix}.y must be a finite number`),
+    w: assertPositiveInt(rect.w, `${messagePrefix}.w must be a positive integer`),
+    h: assertPositiveInt(rect.h, `${messagePrefix}.h must be a positive integer`),
+  };
+}
+
+function assertSize(value: unknown, messagePrefix: string): Size {
+  if (!value || typeof value !== 'object') {
+    throw new Error(`${messagePrefix} must be an object`);
+  }
+  const size = value as Record<string, unknown>;
+  return {
+    w: assertPositiveInt(size.w, `${messagePrefix}.w must be a positive integer`),
+    h: assertPositiveInt(size.h, `${messagePrefix}.h must be a positive integer`),
+  };
+}
+
 function validateSegResult(data: unknown): SegResult {
   if (!data || typeof data !== 'object') {
     throw new Error('SegResult validation failed: expected object');
   }
-  
+
   const d = data as Record<string, unknown>;
-  
+
   if (d.schema_version !== 2) {
     throw new Error(`SegResult validation failed: expected schema_version 2, got ${d.schema_version}`);
   }
-  
+
+  assertSize(d.image_size, 'SegResult image_size');
+
   if (!Array.isArray(d.components)) {
     throw new Error('SegResult validation failed: components must be an array');
   }
-  
+
   if (d.components.length === 0) {
     throw new Error('SegResult validation failed: components array must not be empty');
   }
-  
-  // Validate each component
-  for (let i = 0; i < d.components.length; i++) {
+
+  const primaryIndex = assertFiniteNumber(
+    d.primary_component_index,
+    'SegResult validation failed: primary_component_index must be a number',
+  );
+  if (!Number.isInteger(primaryIndex) || primaryIndex < 0 || primaryIndex >= d.components.length) {
+    throw new Error(
+      `SegResult validation failed: primary_component_index ${primaryIndex} is out of bounds for components length ${d.components.length}`,
+    );
+  }
+
+  for (let i = 0; i < d.components.length; i += 1) {
     const comp = d.components[i] as Record<string, unknown>;
-    if (!comp.id || typeof comp.id !== 'string') {
-      throw new Error(`SegResult validation failed: component[${i}] missing valid 'id'`);
+    const id = assertComponentId(comp.id, `SegResult validation failed: component[${i}] has invalid id`);
+
+    if (typeof comp.label !== 'string' || comp.label.length === 0) {
+      throw new Error(`SegResult validation failed: component[${i}] missing valid label`);
     }
+
+    assertRect(comp.source_bounds, `SegResult component[${i}] source_bounds`);
+    assertSize(comp.image_size, `SegResult component[${i}] image_size`);
+
+    if (typeof comp.masked_png_path !== 'string' || comp.masked_png_path.length === 0) {
+      throw new Error(`SegResult validation failed: component[${i}] missing valid masked_png_path`);
+    }
+
+    if (!Array.isArray(comp.contour)) {
+      throw new Error(`SegResult validation failed: component[${i}] contour must be an array`);
+    }
+    for (let pointIndex = 0; pointIndex < comp.contour.length; pointIndex += 1) {
+      const point = comp.contour[pointIndex];
+      if (!Array.isArray(point) || point.length !== 2) {
+        throw new Error(
+          `SegResult validation failed: component[${i}] contour[${pointIndex}] must be [x, y]`,
+        );
+      }
+      assertFiniteNumber(
+        point[0],
+        `SegResult validation failed: component[${i}] contour[${pointIndex}][0] must be finite`,
+      );
+      assertFiniteNumber(
+        point[1],
+        `SegResult validation failed: component[${i}] contour[${pointIndex}][1] must be finite`,
+      );
+    }
+
     if (!comp.mesh || typeof comp.mesh !== 'object') {
-      throw new Error(`SegResult validation failed: component[${i}] missing 'mesh'`);
+      throw new Error(`SegResult validation failed: component[${i}] missing mesh`);
     }
+
     const mesh = comp.mesh as Record<string, unknown>;
     if (!Array.isArray(mesh.vertices)) {
-      throw new Error(`SegResult validation failed: component[${i}] mesh missing 'vertices' array`);
+      throw new Error(`SegResult validation failed: component[${i}] mesh missing vertices array`);
     }
+    if (mesh.vertices.length === 0) {
+      throw new Error(`SegResult validation failed: component[${i}] mesh vertices must not be empty`);
+    }
+    for (let vertexIndex = 0; vertexIndex < mesh.vertices.length; vertexIndex += 1) {
+      const vertex = mesh.vertices[vertexIndex] as Record<string, unknown>;
+      if (!vertex || typeof vertex !== 'object') {
+        throw new Error(
+          `SegResult validation failed: component[${i}] mesh vertex[${vertexIndex}] must be an object`,
+        );
+      }
+      assertFiniteNumber(
+        vertex.x,
+        `SegResult validation failed: component[${i}] mesh vertex[${vertexIndex}] x must be finite`,
+      );
+      assertFiniteNumber(
+        vertex.y,
+        `SegResult validation failed: component[${i}] mesh vertex[${vertexIndex}] y must be finite`,
+      );
+      assertFiniteNumber(
+        vertex.u,
+        `SegResult validation failed: component[${i}] mesh vertex[${vertexIndex}] u must be finite`,
+      );
+      assertFiniteNumber(
+        vertex.v,
+        `SegResult validation failed: component[${i}] mesh vertex[${vertexIndex}] v must be finite`,
+      );
+    }
+
     if (!Array.isArray(mesh.triangles)) {
-      throw new Error(`SegResult validation failed: component[${i}] mesh missing 'triangles' array`);
+      throw new Error(`SegResult validation failed: component[${i}] mesh missing triangles array`);
+    }
+    for (let triangleIndex = 0; triangleIndex < mesh.triangles.length; triangleIndex += 1) {
+      const triangle = mesh.triangles[triangleIndex];
+      if (!Array.isArray(triangle) || triangle.length !== 3) {
+        throw new Error(
+          `SegResult validation failed: component[${i}] triangle[${triangleIndex}] must have exactly 3 indices`,
+        );
+      }
+      for (let corner = 0; corner < 3; corner += 1) {
+        const indexValue = triangle[corner];
+        if (
+          typeof indexValue !== 'number' ||
+          !Number.isInteger(indexValue) ||
+          indexValue < 0 ||
+          indexValue >= mesh.vertices.length
+        ) {
+          throw new Error(
+            `SegResult validation failed: component[${i}] triangle[${triangleIndex}] index ${String(indexValue)} is out of bounds for ${mesh.vertices.length} vertices`,
+          );
+        }
+      }
+    }
+
+    if (!id) {
+      throw new Error(`SegResult validation failed: component[${i}] id is invalid`);
     }
   }
-  
+
   return d as unknown as SegResult;
 }
 
@@ -501,40 +782,172 @@ function validatePoseResult(data: unknown): PoseResult {
   if (!data || typeof data !== 'object') {
     throw new Error('PoseResult validation failed: expected object');
   }
-  
+
   const d = data as Record<string, unknown>;
-  
+
   if (d.schema_version !== 2) {
     throw new Error(`PoseResult validation failed: expected schema_version 2, got ${d.schema_version}`);
   }
-  
+
   if (!Array.isArray(d.components)) {
     throw new Error('PoseResult validation failed: components must be an array');
   }
-  
+
   if (d.components.length === 0) {
     throw new Error('PoseResult validation failed: components array must not be empty');
   }
-  
-  // Validate each component
-  for (let i = 0; i < d.components.length; i++) {
+
+  for (let i = 0; i < d.components.length; i += 1) {
     const comp = d.components[i] as Record<string, unknown>;
-    if (!comp.id || typeof comp.id !== 'string') {
-      throw new Error(`PoseResult validation failed: component[${i}] missing valid 'id'`);
-    }
+    const componentId = assertComponentId(
+      comp.id,
+      `PoseResult validation failed: component[${i}] has invalid id`,
+    );
+
     if (!comp.skeleton || typeof comp.skeleton !== 'object') {
-      throw new Error(`PoseResult validation failed: component[${i}] missing 'skeleton'`);
+      throw new Error(`PoseResult validation failed: component[${i}] missing skeleton`);
     }
     const skeleton = comp.skeleton as Record<string, unknown>;
-    if (!Array.isArray(skeleton.bones)) {
-      throw new Error(`PoseResult validation failed: component[${i}] skeleton missing 'bones' array`);
+    if (typeof skeleton.type !== 'string' || skeleton.type.length === 0) {
+      throw new Error(`PoseResult validation failed: component[${i}] skeleton missing type`);
     }
+
+    if (!Array.isArray(skeleton.bones) || skeleton.bones.length === 0) {
+      throw new Error(`PoseResult validation failed: component[${i}] skeleton missing bones array`);
+    }
+
+    const boneNames = new Set<string>();
+    for (let boneIndex = 0; boneIndex < skeleton.bones.length; boneIndex += 1) {
+      const bone = skeleton.bones[boneIndex] as Record<string, unknown>;
+      if (!bone || typeof bone !== 'object') {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] must be an object`,
+        );
+      }
+
+      if (typeof bone.name !== 'string' || bone.name.length === 0) {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] missing name`,
+        );
+      }
+      if (boneNames.has(bone.name)) {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] has duplicate bone name "${bone.name}"`,
+        );
+      }
+      boneNames.add(bone.name);
+
+      if (bone.parent !== null && typeof bone.parent !== 'string') {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] has invalid parent`,
+        );
+      }
+
+      if (typeof bone.role !== 'string' || bone.role.length === 0) {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] missing role`,
+        );
+      }
+
+      assertFiniteNumber(
+        bone.length,
+        `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] length must be finite`,
+      );
+
+      const start = bone.start as Record<string, unknown>;
+      const end = bone.end as Record<string, unknown>;
+      if (!start || typeof start !== 'object' || !end || typeof end !== 'object') {
+        throw new Error(
+          `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] start/end must be objects`,
+        );
+      }
+      assertFiniteNumber(
+        start.x,
+        `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] start.x must be finite`,
+      );
+      assertFiniteNumber(
+        start.y,
+        `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] start.y must be finite`,
+      );
+      assertFiniteNumber(
+        end.x,
+        `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] end.x must be finite`,
+      );
+      assertFiniteNumber(
+        end.y,
+        `PoseResult validation failed: component[${i}] skeleton bone[${boneIndex}] end.y must be finite`,
+      );
+    }
+
     if (!Array.isArray(comp.vertex_weights)) {
-      throw new Error(`PoseResult validation failed: component[${i}] missing 'vertex_weights' array`);
+      throw new Error(`PoseResult validation failed: component[${i}] missing vertex_weights array`);
+    }
+
+    if (!componentId) {
+      throw new Error(`PoseResult validation failed: component[${i}] has invalid id`);
     }
   }
-  
+
   return d as unknown as PoseResult;
+}
+
+async function assertPathWithinDirectory(
+  baseDir: string,
+  candidatePath: string,
+  label: string,
+): Promise<void> {
+  const [baseRealPath, candidateRealPath] = await Promise.all([fs.realpath(baseDir), fs.realpath(candidatePath)]);
+  const relative = path.relative(baseRealPath, candidateRealPath);
+  if (relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) {
+    throw new Error(`${label} path escapes expected directory: ${candidatePath}`);
+  }
+}
+
+function validateComponentConsistency(component: SegComponent, poseComponent: PoseComponent): void {
+  const vertexCount = component.mesh.vertices.length;
+  if (poseComponent.vertex_weights.length !== vertexCount) {
+    throw new Error(
+      `Pose component "${poseComponent.id}" returned ${poseComponent.vertex_weights.length} weight rows for ${vertexCount} vertices.`,
+    );
+  }
+
+  const knownBones = new Set(poseComponent.skeleton.bones.map((bone) => bone.name));
+  for (let index = 0; index < poseComponent.vertex_weights.length; index += 1) {
+    const weightMap = poseComponent.vertex_weights[index];
+    if (!weightMap || typeof weightMap !== 'object') {
+      throw new Error(
+        `Pose component "${poseComponent.id}" has invalid weight map at vertex index ${index}.`,
+      );
+    }
+
+    const entries = Object.entries(weightMap);
+    if (entries.length === 0) {
+      throw new Error(
+        `Pose component "${poseComponent.id}" has empty weight map at vertex index ${index}.`,
+      );
+    }
+
+    let total = 0;
+    for (const [boneName, weight] of entries) {
+      if (!knownBones.has(boneName)) {
+        throw new Error(
+          `Pose component "${poseComponent.id}" references unknown bone "${boneName}" at vertex index ${index}.`,
+        );
+      }
+      if (typeof weight !== 'number' || !Number.isFinite(weight) || weight <= 0 || weight > 1) {
+        throw new Error(
+          `Pose component "${poseComponent.id}" has invalid weight ${String(weight)} for bone "${boneName}" at vertex index ${index}.`,
+        );
+      }
+      total += weight;
+    }
+
+    if (!Number.isFinite(total) || total <= 0 || total > 1.01) {
+      throw new Error(
+        `Pose component "${poseComponent.id}" has invalid weight sum ${total.toFixed(4)} at vertex index ${index}.`,
+      );
+    }
+  }
 }
 
 async function runSegmentation(
@@ -566,6 +979,17 @@ async function runSegmentation(
 
   const rawPayload = JSON.parse(await fs.readFile(outputJson, 'utf8'));
   const payload = validateSegResult(rawPayload);
+
+  for (let index = 0; index < payload.components.length; index += 1) {
+    const component = payload.components[index]!;
+    await assertReadableFile(component.masked_png_path);
+    await assertPathWithinDirectory(
+      artifactsDir,
+      component.masked_png_path,
+      `SegResult component[${index}] masked_png_path`,
+    );
+  }
+
   return payload;
 }
 
@@ -804,6 +1228,8 @@ async function writeBundle(
       if (!poseComponent) {
         throw new Error(`Pose result did not contain component "${component.id}".`);
       }
+
+      validateComponentConsistency(component, poseComponent);
 
       const artboardWidth = opts.artboardWidth ?? component.image_size.w;
       const artboardHeight = opts.artboardHeight ?? component.image_size.h;
@@ -1048,5 +1474,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
       log('warn', 'cleanup', 'Temporary directory retained because keepTemp=true.', { tmpDir });
     }
 
+  }
 }
-}
+
+export const __test = {
+  runCommand,
+  validateSegResult,
+  validatePoseResult,
+  validateComponentConsistency,
+  DEFAULT_COMMAND_LIMITS,
+};

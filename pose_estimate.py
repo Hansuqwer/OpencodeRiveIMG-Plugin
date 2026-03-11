@@ -14,17 +14,33 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-import cv2
+
+def _load_cv2() -> tuple[Any, bool]:
+    try:
+        import cv2 as cv2_module  # type: ignore
+
+        return cv2_module, True
+    except Exception:
+        return None, False
+
+
+cv2, CV2_AVAILABLE = _load_cv2()
 import numpy as np
 from PIL import Image
 
-try:
-    import mediapipe as mp  # type: ignore
 
-    MEDIAPIPE_AVAILABLE = True
-except Exception:
-    MEDIAPIPE_AVAILABLE = False
+def _load_mediapipe() -> tuple[Any, bool]:
+    try:
+        import mediapipe as mediapipe_module  # type: ignore
+
+        return mediapipe_module, True
+    except Exception:
+        return None, False
+
+
+mp, MEDIAPIPE_AVAILABLE = _load_mediapipe()
 
 
 @dataclass(frozen=True)
@@ -561,7 +577,11 @@ def point_segment_distance(
     return math.hypot(px - qx, py - qy)
 
 
-def compute_skinning_weights(skeleton: dict, mesh_vertices: list, size):
+def compute_skinning_weights(
+    skeleton: dict[str, Any],
+    mesh_vertices: list[dict[str, Any]],
+    size: tuple[float, float],
+):
     w, h = size
     half_w = w / 2.0
     half_h = h / 2.0
@@ -605,6 +625,13 @@ def landmarks_to_humanoid_skeleton(landmarks, image_size, source_bounds):
     bounds = source_bounds
     crop_cx = bounds["w"] / 2.0
     crop_cy = bounds["h"] / 2.0
+
+    required_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+    max_required = max(required_indices)
+    if landmarks is None or len(landmarks) <= max_required:
+        raise ValueError(
+            f"MediaPipe landmark payload is incomplete: need index {max_required}, got {0 if landmarks is None else len(landmarks) - 1}"
+        )
 
     def px(index):
         lm = landmarks[index]
@@ -669,7 +696,7 @@ def landmarks_to_humanoid_skeleton(landmarks, image_size, source_bounds):
 
 def infer_skeleton(
     mask: np.ndarray,
-    component: dict,
+    component: dict[str, Any],
     input_path: str | None,
     image_size,
     config: SkeletonConfig = DEFAULT_CONFIG,
@@ -694,6 +721,7 @@ def infer_skeleton(
     # --- MediaPipe humanoid attempt (single-subject humanoid images only) ---
     if (
         MEDIAPIPE_AVAILABLE
+        and CV2_AVAILABLE
         and input_path
         and image_size
         and component.get("source_bounds")
@@ -701,15 +729,17 @@ def infer_skeleton(
     ):
         try:
             log("trying MediaPipe humanoid path")
-            mp_pose = mp.solutions.pose
-            bgr = cv2.imread(input_path)
+            mp_any: Any = mp
+            mp_pose = mp_any.solutions.pose
+            cv2_any: Any = cv2
+            bgr = cv2_any.imread(input_path)
             if bgr is not None:
                 with mp_pose.Pose(
                     static_image_mode=True,
                     model_complexity=1,
                     min_detection_confidence=config.mediapipe_min_confidence,
                 ) as pose:
-                    result = pose.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                    result = pose.process(cv2_any.cvtColor(bgr, cv2_any.COLOR_BGR2RGB))
                     if result.pose_landmarks:
                         return landmarks_to_humanoid_skeleton(
                             result.pose_landmarks.landmark,
@@ -799,8 +829,10 @@ def main():
                     "vertex_weights": weights,
                 }
             )
+            bones = skeleton.get("bones")
+            bone_count = len(bones) if isinstance(bones, list) else 0
             log(
-                f"{component['id']}: {skeleton['type']} / {len(skeleton['bones'])} bones / "
+                f"{component['id']}: {skeleton['type']} / {bone_count} bones / "
                 f"{len(weights)} weighted vertices"
             )
 

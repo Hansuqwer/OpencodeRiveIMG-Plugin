@@ -11,21 +11,64 @@ const TOOL_VERSION = '0.2.0';
 const ANIMATION_PRESETS: AnimationPreset[] = ['idle', 'walk', 'wave', 'jump', 'run', 'death'];
 const SHEET_MODES = new Set(['auto', 'single', 'split']);
 
-/**
- * Resolves a user-provided path against a base directory and validates
- * that the resolved path does not escape the base directory.
- * Prevents path traversal attacks (e.g., ../../../etc/passwd).
- */
-function safeResolvePath(baseDir: string, userPath: string): string {
+interface PathResolutionOptions {
+  mustExist: boolean;
+  purpose: string;
+}
+
+function getRealPath(targetPath: string): string {
+  return fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath);
+}
+
+function findNearestExistingAncestor(targetPath: string): string {
+  let current = targetPath;
+  while (!existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      throw new Error(`Unable to resolve existing parent directory for path: ${targetPath}`);
+    }
+    current = parent;
+  }
+  return current;
+}
+
+function isWithinBase(baseRealPath: string, candidateRealPath: string): boolean {
+  const relative = path.relative(baseRealPath, candidateRealPath);
+  if (relative === '') {
+    return true;
+  }
+  return !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+export function resolvePathWithinBase(
+  baseDir: string,
+  userPath: string,
+  options: PathResolutionOptions,
+): string {
+  if (!existsSync(baseDir)) {
+    throw new Error(`Base directory does not exist: ${baseDir}`);
+  }
+
+  const baseRealPath = getRealPath(path.resolve(baseDir));
   const resolved = path.resolve(baseDir, userPath);
-  const normalizedBase = path.normalize(baseDir + path.sep);
-  const normalizedResolved = path.normalize(resolved + path.sep);
-  
-  // Check that resolved path is within base directory
-  if (!normalizedResolved.startsWith(normalizedBase)) {
+
+  if (options.mustExist) {
+    if (!existsSync(resolved)) {
+      throw new Error(`${options.purpose} path not found: ${resolved}`);
+    }
+    const candidateRealPath = getRealPath(resolved);
+    if (!isWithinBase(baseRealPath, candidateRealPath)) {
+      throw new Error(`Path traversal denied: "${userPath}" escapes base directory`);
+    }
+    return resolved;
+  }
+
+  const existingAnchor = findNearestExistingAncestor(resolved);
+  const anchorRealPath = getRealPath(existingAnchor);
+  if (!isWithinBase(baseRealPath, anchorRealPath)) {
     throw new Error(`Path traversal denied: "${userPath}" escapes base directory`);
   }
-  
+
   return resolved;
 }
 
@@ -190,6 +233,14 @@ function parseNumber(value: string | undefined, flag: string): number {
   return parsed;
 }
 
+function expectValue(args: string[], index: number, flag: string): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith('-')) {
+    fail(`missing value for ${flag}`);
+  }
+  return value;
+}
+
 function parseAnimationList(value: string | undefined): AnimationPreset[] {
   if (!value) {
     fail('missing value for --animations');
@@ -221,22 +272,28 @@ function parseConvertArgs(args: string[]): ConvertCliArgs {
       case '-o':
       case '--output':
       case '--output-bundle':
-        result.output = args[++index];
+        result.output = expectValue(args, index, '--output');
+        index += 1;
         break;
       case '--mesh-density':
-        result.meshDensity = parseNumber(args[++index], '--mesh-density');
+        result.meshDensity = parseNumber(expectValue(args, index, '--mesh-density'), '--mesh-density');
+        index += 1;
         break;
       case '--animations':
-        result.animations = parseAnimationList(args[++index]);
+        result.animations = parseAnimationList(expectValue(args, index, '--animations'));
+        index += 1;
         break;
       case '--width':
-        result.width = parseNumber(args[++index], '--width');
+        result.width = parseNumber(expectValue(args, index, '--width'), '--width');
+        index += 1;
         break;
       case '--height':
-        result.height = parseNumber(args[++index], '--height');
+        result.height = parseNumber(expectValue(args, index, '--height'), '--height');
+        index += 1;
         break;
       case '--sheet-mode': {
-        const mode = args[++index];
+        const mode = expectValue(args, index, '--sheet-mode');
+        index += 1;
         if (!mode || !SHEET_MODES.has(mode)) {
           fail(`invalid value for --sheet-mode: ${mode ?? '(missing)'}`);
         }
@@ -271,16 +328,17 @@ function parseConvertArgs(args: string[]): ConvertCliArgs {
 
 async function runConvertCli(args: string[]): Promise<void> {
   const parsed = parseConvertArgs(args);
-  const input = path.resolve(parsed.input);
+  const baseDir = process.cwd();
+  const input = resolvePathWithinBase(baseDir, parsed.input, {
+    mustExist: true,
+    purpose: 'input',
+  });
 
-  if (!existsSync(input)) {
-    fail(`input file not found: ${input}`);
-  }
-
+  const defaultOutputPath = path.join(path.dirname(input), `${path.parse(input).name}.rivebundle`);
   const output =
     parsed.output !== undefined
-      ? path.resolve(parsed.output)
-      : path.resolve(path.join(path.dirname(input), `${path.parse(input).name}.rivebundle`));
+      ? resolvePathWithinBase(baseDir, parsed.output, { mustExist: false, purpose: 'output' })
+      : resolvePathWithinBase(baseDir, defaultOutputPath, { mustExist: false, purpose: 'output' });
 
   const options: PipelineOptions = {
     inputImage: input,
@@ -467,15 +525,21 @@ const imageToRiveTool: OpenCodeTool = {
     },
   },
   async execute(params, ctx) {
-    // Validate and resolve input/output paths to prevent path traversal
-    const inputImage = safeResolvePath(ctx.cwd, String(params.input_image));
+    const inputRaw = String(params.input_image ?? '');
+    const inputImage = resolvePathWithinBase(ctx.cwd, inputRaw, {
+      mustExist: true,
+      purpose: 'input',
+    });
     const outputBundleRaw =
       typeof params.output_bundle === 'string'
         ? params.output_bundle
         : typeof params.output_riv === 'string'
           ? params.output_riv
           : `${path.parse(inputImage).name}.rivebundle`;
-    const outputBundle = safeResolvePath(ctx.cwd, outputBundleRaw);
+    const outputBundle = resolvePathWithinBase(ctx.cwd, outputBundleRaw, {
+      mustExist: false,
+      purpose: 'output',
+    });
 
 
     ctx.log(`image-to-rive: processing ${inputImage}`);
