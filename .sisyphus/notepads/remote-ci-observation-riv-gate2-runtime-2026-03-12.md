@@ -48,8 +48,34 @@ Local workflow declares strict Gate 2 matrix job in `.github/workflows/ci.yml`:
 Additional local policy references:
 - `HANDOVER.md` states strict CI job and required status posture for Gate 3.
 
-## Conclusion
-Remote CI evidence for `riv-gate2-runtime` cannot be captured yet because the remote default branch currently has no Actions workflows or runs. The strict gate exists locally, but there is no remote workflow execution history to observe at this time.
+## Execution Update (Published + Triggered)
+Follow-up execution completed after initial observation:
 
-## Next Required Step for Remote Evidence
-To obtain remote proof, publish a branch/commit that includes `.github/workflows/ci.yml` and trigger a run (push or PR), then re-run observation commands above.
+1. Published branch: `phase4/remote-ci-evidence`
+   - Commit: `e21cd1401d208160103952178cda00fe760e7eb3`
+2. Opened PR: `https://github.com/Hansuqwer/OpencodeRiveIMG-Plugin/pull/1`
+   - Base: `master`
+   - Head: `phase4/remote-ci-evidence`
+3. Triggered CI run via `pull_request` event:
+   - Run ID: `23007034102`
+   - Run URL: `https://github.com/Hansuqwer/OpencodeRiveIMG-Plugin/actions/runs/23007034102`
+   - Workflow: `CI`
+
+## Run Evidence (riv-gate2-runtime)
+`riv-gate2-runtime` matrix jobs were created and executed as strict checks:
+
+- `gate2-runtime / ubuntu-latest / node-22` (job `66806693172`) -> `failure`
+- `gate2-runtime / windows-latest / node-22` (job `66806693196`) -> `failure`
+- `gate2-runtime / macos-latest / node-22` (job `66806693227`) -> `failure`
+
+Each `riv-gate2-runtime` check-run annotation message is identical:
+
+> "The job was not started because your account is locked due to a billing issue."
+
+This was confirmed through each check-run annotation endpoint.
+
+## Conclusion
+Remote CI evidence is now captured end-to-end: workflow publication, PR-triggered run creation, and strict `riv-gate2-runtime` job records. The current blocker is not pipeline logic but GitHub billing lock on the account, which prevents job execution from starting.
+
+## Next Required Step
+Resolve GitHub billing lock, then re-run PR CI (or re-run failed jobs) to collect pass/fail evidence for runtime execution itself.
