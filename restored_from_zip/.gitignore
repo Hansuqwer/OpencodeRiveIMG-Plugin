@@ -1,0 +1,12 @@
+dist/
+node_modules/
+*.log
+*.tmp
+*.tsbuildinfo
+.venv/
+.tmp/
+.test-output/
+.review-output/
+.rive/
+__pycache__/
+*.pyc

@@ -1,0 +1,2 @@
+rembg>=2.0.50
+mediapipe>=0.10.14
