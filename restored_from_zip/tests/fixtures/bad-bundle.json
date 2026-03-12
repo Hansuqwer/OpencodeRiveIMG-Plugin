@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "kind": "INVALID_KIND",
+  "export": {
+    "status": "fallback"
+  },
+  "artboards": [],
+  "primary_artboard_id": null
+}

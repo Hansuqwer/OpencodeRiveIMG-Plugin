@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "rivebundle",
+  "export": {
+    "status": "fallback",
+    "output_format": "rivebundle",
+    "riv_supported": false
+  },
+  "tool": {
+    "name": "image-to-rive",
+    "version": "0.2.0"
+  },
+  "input": {
+    "source_image": "/fixtures/humanoid.png",
+    "requested_output_path": "/fixtures/humanoid.rivebundle",
+    "actual_output_path": "/fixtures/humanoid.rivebundle",
+    "sheet_detected": false,
+    "component_count": 1,
+    "background_method": "alpha"
+  },
+  "config": {
+    "mesh_density": 0.08,
+    "animations": ["idle", "walk"],
+    "artboard_width_override": 512,
+    "artboard_height_override": 768,
+    "sheet_mode": "single"
+  },
+  "primary_artboard_id": "character_01",
+  "artboards": [
+    {
+      "id": "character_01",
+      "name": "Character 01",
+      "bundleDir": "humanoid.rivebundle/artboards/character_01",
+      "maskedImagePath": "humanoid.rivebundle/artboards/character_01/masked.png",
+      "contourSvgPath": "humanoid.rivebundle/artboards/character_01/contour.svg",
+      "meshSvgPath": "humanoid.rivebundle/artboards/character_01/mesh.svg",
+      "rigPreviewPath": "humanoid.rivebundle/artboards/character_01/rig-preview.svg",
+      "riveIrPath": "humanoid.rivebundle/artboards/character_01/rive_ir.json",
+      "sourceBounds": { "x": 0, "y": 0, "w": 512, "h": 768 },
+      "artboardWidth": 512,
+      "artboardHeight": 768,
+      "boneCount": 12,
+      "vertexCount": 84,
+      "triangleCount": 68,
+      "skeletonType": "humanoid"
+    }
+  ],
+  "state_machine_path": "state_machine.json",
+  "logs_path": "logs.json",
+  "import_notes_path": "IMPORT_INTO_RIVE.md"
+}

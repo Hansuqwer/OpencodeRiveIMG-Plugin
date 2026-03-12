@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / node-${{ matrix.node }} / py-${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20', '22']
+        python: ['3.11']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: restored_from_zip/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: restored_from_zip
+
+      - name: Install required Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+        working-directory: restored_from_zip
+
+      - name: Install optional Python dependencies
+        run: python -m pip install -r requirements.optional.txt || true
+        working-directory: restored_from_zip
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: restored_from_zip
+
+      - name: Lint
+        run: npm run lint
+        working-directory: restored_from_zip
+
+      - name: Test
+        run: npm test
+        working-directory: restored_from_zip
+
+      - name: Validate test fixtures
+        run: npm run validate:fixtures
+        working-directory: restored_from_zip
+
+      - name: Audit npm production dependencies
+        run: npm run audit:npm
+        working-directory: restored_from_zip
+
+      - name: Audit required Python dependencies
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r requirements.txt
+        working-directory: restored_from_zip
+
+      - name: Audit optional Python dependencies (warn only)
+        run: |
+          python -m pip_audit -r requirements.optional.txt || echo "::warning::pip-audit found issues in optional dependencies — review and upgrade when convenient"
+        working-directory: restored_from_zip
+
+  riv-gate2-runtime:
+    name: gate2-runtime / ${{ matrix.os }} / node-${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['22']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: restored_from_zip/package-lock.json
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: restored_from_zip
+
+      - name: Build
+        run: npm run build
+        working-directory: restored_from_zip
+
+      - name: Run Gate 2 runtime scaffold tests
+        env:
+          RUN_RIVE_GATE2: '1'
+          RUN_RIVE_GATE2_EXPECT_PASS: '1'
+        run: node --test dist/pipeline.test.js
+        working-directory: restored_from_zip
