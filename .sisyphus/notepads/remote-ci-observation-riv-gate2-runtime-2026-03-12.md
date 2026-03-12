@@ -56,9 +56,12 @@ Follow-up execution completed after initial observation:
 2. Opened PR: `https://github.com/Hansuqwer/OpencodeRiveIMG-Plugin/pull/1`
    - Base: `master`
    - Head: `phase4/remote-ci-evidence`
-3. Triggered CI run via `pull_request` event:
-   - Run ID: `23007034102`
+3. Triggered CI runs via `pull_request` event:
+   - Run ID `23007034102` -> `failure`
    - Run URL: `https://github.com/Hansuqwer/OpencodeRiveIMG-Plugin/actions/runs/23007034102`
+   - Follow-up run after evidence-note push:
+     - Run ID `23007284893` -> `failure`
+     - Run URL: `https://github.com/Hansuqwer/OpencodeRiveIMG-Plugin/actions/runs/23007284893`
    - Workflow: `CI`
 
 ## Run Evidence (riv-gate2-runtime)
@@ -72,7 +75,9 @@ Each `riv-gate2-runtime` check-run annotation message is identical:
 
 > "The job was not started because your account is locked due to a billing issue."
 
-This was confirmed through each check-run annotation endpoint.
+This was confirmed through check-run annotation endpoints for both runs.
+
+On run `23007284893`, one gate2 matrix entry reached completed-failure immediately (`gate2-runtime / windows-latest / node-22`) and the other two gate2 entries remained `queued` with the same billing-lock symptom, while the overall run still concluded `failure`.
 
 ## Conclusion
 Remote CI evidence is now captured end-to-end: workflow publication, PR-triggered run creation, and strict `riv-gate2-runtime` job records. The current blocker is not pipeline logic but GitHub billing lock on the account, which prevents job execution from starting.
